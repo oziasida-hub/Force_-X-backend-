@@ -1,11 +1,12 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
 from ultralytics import YOLO
 import numpy as np
 import cv2
 from datetime import datetime
 
 app = Flask(__name__)
-
+CORS(app, origins=["https://force-x.onrender.com"])
 model = YOLO("yolo11n.pt")
 
 @app.route("/")
