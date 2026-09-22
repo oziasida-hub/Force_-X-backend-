@@ -1,4 +1,6 @@
 flask
+flask-cors
 ultralytics
-opencv-python-headless
 numpy
+opencv-python-headless
+gunicorn
