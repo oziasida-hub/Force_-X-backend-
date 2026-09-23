@@ -4,13 +4,13 @@ from ultralytics import YOLO
 import numpy as np
 import cv2
 from datetime import datetime
+from base64 import b64decode
 
 app = Flask(__name__)
 CORS(app, origins=["https://force-x-frontend.onrender.com"])
 model = YOLO("yolo11n.pt")
 
-
-@app.route("/")
+app.route("/")
 def home():
     return jsonify({
         "name": "Snow AI",
