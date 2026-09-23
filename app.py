@@ -10,7 +10,7 @@ app = Flask(__name__)
 CORS(app, origins=["https://force-x-frontend.onrender.com"])
 model = YOLO("yolo11n.pt")
 
-app.route("/")
+@app.route("/")
 def home():
     return jsonify({
         "name": "Snow AI",
