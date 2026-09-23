@@ -6,7 +6,7 @@ import cv2
 from datetime import datetime
 
 app = Flask(__name__)
-CORS(app, origins=["https://force-x-frontend.onrender.com"]
+CORS(app, origins=["https://force-x-frontend.onrender.com"])
 model = YOLO("yolo11n.pt")
 
 
