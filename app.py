@@ -43,12 +43,15 @@ object_info = {
     "backpack": "A bag designed to be carried on a person's back."
 }
 
+
 @app.route("/")
 def home():
     return jsonify({
         "name": "Snow AI",
-        "status": "online"
+        "status": "online",
+        "gps": "supported"
     })
+
 
 @app.route("/detect", methods=["POST"])
 def detect():
@@ -71,6 +74,10 @@ def detect():
 
         image_data = data["image"]
 
+        # -----------------------------
+        # Detection information
+        # -----------------------------
+
         timestamp = data.get(
             "timestamp",
             datetime.now().isoformat()
@@ -80,6 +87,50 @@ def detect():
             "duration",
             "0"
         )
+
+        # -----------------------------
+        # GPS information
+        # -----------------------------
+
+        latitude = data.get("latitude")
+        longitude = data.get("longitude")
+        accuracy = data.get("accuracy")
+
+        # Convert GPS values to numbers when supplied
+        try:
+            if latitude is not None:
+                latitude = float(latitude)
+
+            if longitude is not None:
+                longitude = float(longitude)
+
+            if accuracy is not None:
+                accuracy = float(accuracy)
+
+        except (ValueError, TypeError):
+            return jsonify({
+                "success": False,
+                "error": "Invalid GPS coordinates"
+            }), 400
+
+        # Validate coordinate ranges
+        if latitude is not None:
+            if latitude < -90 or latitude > 90:
+                return jsonify({
+                    "success": False,
+                    "error": "Latitude must be between -90 and 90"
+                }), 400
+
+        if longitude is not None:
+            if longitude < -180 or longitude > 180:
+                return jsonify({
+                    "success": False,
+                    "error": "Longitude must be between -180 and 180"
+                }), 400
+
+        # -----------------------------
+        # Decode image
+        # -----------------------------
 
         image_bytes = b64decode(
             image_data.split(",", 1)[1]
@@ -98,6 +149,10 @@ def detect():
                 "success": False,
                 "error": "Invalid image"
             }), 400
+
+        # -----------------------------
+        # Snow AI detection
+        # -----------------------------
 
         results = model(frame)
 
@@ -144,6 +199,10 @@ def detect():
                         google_url
                 })
 
+        # -----------------------------
+        # Response
+        # -----------------------------
+
         return jsonify({
 
             "success": True,
@@ -155,6 +214,18 @@ def detect():
 
             "duration":
                 duration,
+
+            "location": {
+
+                "latitude":
+                    latitude,
+
+                "longitude":
+                    longitude,
+
+                "accuracy":
+                    accuracy
+            },
 
             "objects":
                 objects
