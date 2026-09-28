@@ -6,6 +6,9 @@ from base64 import b64decode
 import numpy as np
 import cv2
 import urllib.parse
+import urllib.request
+import json
+import os
 
 app = Flask(__name__)
 
@@ -18,6 +21,12 @@ CORS(
 )
 
 model = YOLO("yolo11n.pt")
+
+VISION_API_KEY = os.environ.get("VISION_API_KEY")
+
+VISION_URL = (
+    "https://vision.googleapis.com/v1/images:annotate"
+)
 
 object_info = {
     "person": "A human being.",
@@ -44,16 +53,308 @@ object_info = {
 }
 
 
+def verify_image_online(image_bytes):
+
+    if not VISION_API_KEY:
+        return {
+            "available": False,
+            "message": "Online verification is not configured."
+        }
+
+    try:
+        encoded_image = (
+            __import__("base64")
+            .b64encode(image_bytes)
+            .decode("utf-8")
+        )
+
+        payload = {
+            "requests": [
+                {
+                    "image": {
+                        "content": encoded_image
+                    },
+                    "features": [
+                        {
+                            "type": "WEB_DETECTION",
+                            "maxResults": 10
+                        }
+                    ]
+                }
+            ]
+        }
+
+        url = (
+            VISION_URL
+            + "?key="
+            + urllib.parse.quote(VISION_API_KEY)
+        )
+
+        request_data = json.dumps(
+            payload
+        ).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=request_data,
+            headers={
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(
+            req,
+            timeout=20
+        ) as response:
+
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
+
+        response_data = result.get(
+            "responses",
+            [{}]
+        )[0]
+
+        web = response_data.get(
+            "webDetection",
+            {}
+        )
+
+        best_guess = []
+
+        for item in web.get(
+            "bestGuessLabels",
+            []
+        ):
+
+            label = item.get("label")
+
+            if label:
+                best_guess.append(label)
+
+        entities = []
+
+        for entity in web.get(
+            "webEntities",
+            []
+        ):
+
+            description = entity.get(
+                "description"
+            )
+
+            score = entity.get(
+                "score"
+            )
+
+            if description:
+
+                entities.append({
+                    "name": description,
+                    "score": score
+                })
+
+        matching_pages = []
+
+        for page in web.get(
+            "pagesWithMatchingImages",
+            []
+        ):
+
+            page_url = page.get("url")
+            page_title = page.get("pageTitle")
+
+            if page_url:
+
+                matching_pages.append({
+                    "title":
+                        page_title or "Matching web page",
+                    "url":
+                        page_url
+                })
+
+        full_matches = []
+
+        for image in web.get(
+            "fullMatchingImages",
+            []
+        ):
+
+            image_url = image.get("url")
+
+            if image_url:
+                full_matches.append(image_url)
+
+        partial_matches = []
+
+        for image in web.get(
+            "partialMatchingImages",
+            []
+        ):
+
+            image_url = image.get("url")
+
+            if image_url:
+                partial_matches.append(image_url)
+
+        visually_similar = []
+
+        for image in web.get(
+            "visuallySimilarImages",
+            []
+        ):
+
+            image_url = image.get("url")
+
+            if image_url:
+                visually_similar.append(image_url)
+
+        return {
+            "available": True,
+            "best_guess": best_guess,
+            "web_entities": entities[:10],
+            "matching_pages": matching_pages[:10],
+            "full_matches": full_matches[:5],
+            "partial_matches": partial_matches[:5],
+            "visually_similar": visually_similar[:5]
+        }
+
+    except Exception as error:
+
+        print(
+            "Online verification error:",
+            error
+        )
+
+        return {
+            "available": False,
+            "message": "Online verification failed."
+        }
+
+
+def determine_precise_identity(
+    object_name,
+    web_result
+):
+
+    best_guess = web_result.get(
+        "best_guess",
+        []
+    )
+
+    entities = web_result.get(
+        "web_entities",
+        []
+    )
+
+    online_names = []
+
+    for item in best_guess:
+
+        online_names.append(
+            item.lower()
+        )
+
+    for entity in entities:
+
+        name = entity.get(
+            "name",
+            ""
+        )
+
+        if name:
+
+            online_names.append(
+                name.lower()
+            )
+
+    known_species = [
+        {
+            "common": "Bonobo",
+            "scientific": "Pan paniscus",
+            "type": "Great ape",
+            "keywords": [
+                "bonobo",
+                "pan paniscus"
+            ]
+        },
+        {
+            "common": "Okapi",
+            "scientific": "Okapia johnstoni",
+            "type": "Giraffid",
+            "keywords": [
+                "okapi",
+                "okapia johnstoni"
+            ]
+        },
+        {
+            "common": "Likweli",
+            "scientific": "Colobus congoensis",
+            "type": "Colobus monkey",
+            "keywords": [
+                "likweli",
+                "colobus congoensis"
+            ]
+        }
+    ]
+
+    for species in known_species:
+
+        for online_name in online_names:
+
+            for keyword in species["keywords"]:
+
+                if keyword in online_name:
+
+                    return {
+                        "identified": True,
+                        "type": species["type"],
+                        "species": species["common"],
+                        "scientific_name":
+                            species["scientific"],
+                        "source":
+                            "Online web verification"
+                    }
+
+    if best_guess:
+
+        return {
+            "identified": True,
+            "type": object_name.title(),
+            "species": best_guess[0],
+            "scientific_name": None,
+            "source":
+                "Online web verification"
+        }
+
+    return {
+        "identified": False,
+        "type": object_name.title(),
+        "species": "Unknown",
+        "scientific_name": None,
+        "source":
+            "Snow AI object detection only"
+    }
+
+
 @app.route("/")
 def home():
+
     return jsonify({
         "name": "Snow AI",
         "status": "online",
-        "gps": "supported"
+        "gps": "supported",
+        "online_verification":
+            bool(VISION_API_KEY)
     })
 
 
-@app.route("/detect", methods=["POST"])
+@app.route(
+    "/detect",
+    methods=["POST"]
+)
 def detect():
 
     try:
@@ -61,22 +362,20 @@ def detect():
         data = request.get_json()
 
         if not data:
+
             return jsonify({
                 "success": False,
                 "error": "No JSON data received"
             }), 400
 
         if "image" not in data:
+
             return jsonify({
                 "success": False,
                 "error": "No image provided"
             }), 400
 
         image_data = data["image"]
-
-        # -----------------------------
-        # Detection information
-        # -----------------------------
 
         timestamp = data.get(
             "timestamp",
@@ -88,16 +387,21 @@ def detect():
             "0"
         )
 
-        # -----------------------------
-        # GPS information
-        # -----------------------------
+        latitude = data.get(
+            "latitude"
+        )
 
-        latitude = data.get("latitude")
-        longitude = data.get("longitude")
-        accuracy = data.get("accuracy")
+        longitude = data.get(
+            "longitude"
+        )
 
-        # Convert GPS values to numbers when supplied
+        accuracy = data.get(
+            "accuracy",
+            data.get("gps_accuracy")
+        )
+
         try:
+
             if latitude is not None:
                 latitude = float(latitude)
 
@@ -107,34 +411,55 @@ def detect():
             if accuracy is not None:
                 accuracy = float(accuracy)
 
-        except (ValueError, TypeError):
+        except (
+            ValueError,
+            TypeError
+        ):
+
             return jsonify({
                 "success": False,
                 "error": "Invalid GPS coordinates"
             }), 400
 
-        # Validate coordinate ranges
         if latitude is not None:
+
             if latitude < -90 or latitude > 90:
+
                 return jsonify({
                     "success": False,
-                    "error": "Latitude must be between -90 and 90"
+                    "error":
+                        "Latitude must be between -90 and 90"
                 }), 400
 
         if longitude is not None:
+
             if longitude < -180 or longitude > 180:
+
                 return jsonify({
                     "success": False,
-                    "error": "Longitude must be between -180 and 180"
+                    "error":
+                        "Longitude must be between -180 and 180"
                 }), 400
 
-        # -----------------------------
-        # Decode image
-        # -----------------------------
+        if "," in image_data:
 
-        image_bytes = b64decode(
-            image_data.split(",", 1)[1]
-        )
+            image_data = image_data.split(
+                ",",
+                1
+            )[1]
+
+        try:
+
+            image_bytes = b64decode(
+                image_data
+            )
+
+        except Exception:
+
+            return jsonify({
+                "success": False,
+                "error": "Invalid Base64 image"
+            }), 400
 
         frame = cv2.imdecode(
             np.frombuffer(
@@ -145,24 +470,27 @@ def detect():
         )
 
         if frame is None:
+
             return jsonify({
                 "success": False,
                 "error": "Invalid image"
             }), 400
 
-        # -----------------------------
-        # Snow AI detection
-        # -----------------------------
-
         results = model(frame)
 
         objects = []
+
+        online_result = verify_image_online(
+            image_bytes
+        )
 
         for result in results:
 
             for box in result.boxes:
 
-                class_id = int(box.cls[0])
+                class_id = int(
+                    box.cls[0]
+                )
 
                 confidence = float(
                     box.conf[0]
@@ -174,13 +502,24 @@ def detect():
 
                 description = object_info.get(
                     object_name,
-                    "Snow AI detected this object, but a built-in description is not available yet."
+                    "Snow AI detected this object, "
+                    "but a built-in description "
+                    "is not available yet."
+                )
+
+                precise = determine_precise_identity(
+                    object_name,
+                    online_result
                 )
 
                 google_url = (
                     "https://www.google.com/search?q="
                     + urllib.parse.quote(
-                        object_name + " information"
+                        (
+                            precise.get("species")
+                            or object_name
+                        )
+                        + " information"
                     )
                 )
 
@@ -192,6 +531,22 @@ def detect():
                     "confidence":
                         f"{confidence:.1%}",
 
+                    "type":
+                        precise.get("type"),
+
+                    "species":
+                        precise.get("species"),
+
+                    "scientific_name":
+                        precise.get(
+                            "scientific_name"
+                        ),
+
+                    "identification_source":
+                        precise.get(
+                            "source"
+                        ),
+
                     "description":
                         description,
 
@@ -199,15 +554,16 @@ def detect():
                         google_url
                 })
 
-        # -----------------------------
-        # Response
-        # -----------------------------
-
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
-            "snow_ai": True,
+            "snow_ai":
+                True,
+
+            "online_verification":
+                online_result,
 
             "timestamp":
                 timestamp,
@@ -233,9 +589,15 @@ def detect():
 
     except Exception as error:
 
+        print(
+            "Detection error:",
+            error
+        )
+
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "error":
                 str(error)
@@ -244,8 +606,6 @@ def detect():
 
 
 if __name__ == "__main__":
-
-    import os
 
     app.run(
         host="0.0.0.0",
