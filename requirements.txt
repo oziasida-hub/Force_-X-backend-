@@ -4,3 +4,4 @@ ultralytics
 numpy
 opencv-python-headless
 gunicorn
+google-genai
