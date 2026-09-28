@@ -3,12 +3,16 @@ from flask_cors import CORS
 from ultralytics import YOLO
 from datetime import datetime
 from base64 import b64decode
+from google import genai
+from google.genai import types
+
 import numpy as np
 import cv2
 import urllib.parse
 import urllib.request
 import json
 import os
+
 
 app = Flask(__name__)
 
@@ -22,11 +26,73 @@ CORS(
 
 model = YOLO("yolo11n.pt")
 
-VISION_API_KEY = os.environ.get("VISION_API_KEY")
-
-VISION_URL = (
-    "https://vision.googleapis.com/v1/images:annotate"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
 )
+
+gemini_client = None
+
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+
+KNOWLEDGE_FILE = "knowledge_base.json"
+
+
+def load_knowledge():
+
+    if not os.path.exists(KNOWLEDGE_FILE):
+        return {}
+
+    try:
+        with open(
+            KNOWLEDGE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            return json.load(file)
+
+    except Exception as error:
+
+        print(
+            "Knowledge database load error:",
+            error
+        )
+
+        return {}
+
+
+def save_knowledge(database):
+
+    try:
+
+        with open(
+            KNOWLEDGE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                database,
+                file,
+                indent=4,
+                ensure_ascii=False
+            )
+
+    except Exception as error:
+
+        print(
+            "Knowledge database save error:",
+            error
+        )
+
+
+knowledge_base = load_knowledge()
+
 
 object_info = {
     "person": "A human being.",
@@ -53,289 +119,440 @@ object_info = {
 }
 
 
-def verify_image_online(image_bytes):
+def analyze_image_with_gemini(
+    image_bytes,
+    object_name,
+    yolo_confidence
+):
 
-    if not VISION_API_KEY:
+    if not gemini_client:
+
         return {
             "available": False,
-            "message": "Online verification is not configured."
+            "identified": False,
+            "message": "Gemini is not configured."
         }
+
+    prompt = f"""
+You are the visual verification system for Snow AI.
+
+YOLO detected this object as:
+{object_name}
+
+YOLO confidence:
+{yolo_confidence:.1%}
+
+Analyze the supplied image carefully.
+
+Determine:
+1. What object or animal is actually visible.
+2. The most specific identification that can reasonably be made from the image.
+3. For animals, give the likely species if the visual evidence supports it.
+4. For domestic animals, give a breed only if the image provides enough evidence.
+5. Give the scientific name only when reasonably confident.
+6. Do not invent an identification.
+7. If the image is insufficient for precise identification, say so.
+
+Return ONLY valid JSON in this exact structure:
+
+{{
+  "identified": true,
+  "name": "specific name",
+  "type": "general type",
+  "species": "species or null",
+  "scientific_name": "scientific name or null",
+  "breed": "breed or null",
+  "confidence": 0.0,
+  "reason": "short explanation"
+}}
+
+The confidence value must be between 0 and 1.
+"""
 
     try:
-        encoded_image = (
-            __import__("base64")
-            .b64encode(image_bytes)
-            .decode("utf-8")
-        )
 
-        payload = {
-            "requests": [
-                {
-                    "image": {
-                        "content": encoded_image
-                    },
-                    "features": [
-                        {
-                            "type": "WEB_DETECTION",
-                            "maxResults": 10
-                        }
-                    ]
-                }
-            ]
-        }
-
-        url = (
-            VISION_URL
-            + "?key="
-            + urllib.parse.quote(VISION_API_KEY)
-        )
-
-        request_data = json.dumps(
-            payload
-        ).encode("utf-8")
-
-        req = urllib.request.Request(
-            url,
-            data=request_data,
-            headers={
-                "Content-Type": "application/json"
-            },
-            method="POST"
-        )
-
-        with urllib.request.urlopen(
-            req,
-            timeout=20
-        ) as response:
-
-            result = json.loads(
-                response.read().decode("utf-8")
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg"
+                ),
+                prompt
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=500
             )
-
-        response_data = result.get(
-            "responses",
-            [{}]
-        )[0]
-
-        web = response_data.get(
-            "webDetection",
-            {}
         )
 
-        best_guess = []
+        text = response.text.strip()
 
-        for item in web.get(
-            "bestGuessLabels",
-            []
-        ):
+        if text.startswith("```"):
+            text = text.replace(
+                "```json",
+                ""
+            ).replace(
+                "```",
+                ""
+            ).strip()
 
-            label = item.get("label")
+        result = json.loads(text)
 
-            if label:
-                best_guess.append(label)
-
-        entities = []
-
-        for entity in web.get(
-            "webEntities",
-            []
-        ):
-
-            description = entity.get(
-                "description"
+        if not isinstance(result, dict):
+            raise ValueError(
+                "Gemini returned invalid data."
             )
-
-            score = entity.get(
-                "score"
-            )
-
-            if description:
-
-                entities.append({
-                    "name": description,
-                    "score": score
-                })
-
-        matching_pages = []
-
-        for page in web.get(
-            "pagesWithMatchingImages",
-            []
-        ):
-
-            page_url = page.get("url")
-            page_title = page.get("pageTitle")
-
-            if page_url:
-
-                matching_pages.append({
-                    "title":
-                        page_title or "Matching web page",
-                    "url":
-                        page_url
-                })
-
-        full_matches = []
-
-        for image in web.get(
-            "fullMatchingImages",
-            []
-        ):
-
-            image_url = image.get("url")
-
-            if image_url:
-                full_matches.append(image_url)
-
-        partial_matches = []
-
-        for image in web.get(
-            "partialMatchingImages",
-            []
-        ):
-
-            image_url = image.get("url")
-
-            if image_url:
-                partial_matches.append(image_url)
-
-        visually_similar = []
-
-        for image in web.get(
-            "visuallySimilarImages",
-            []
-        ):
-
-            image_url = image.get("url")
-
-            if image_url:
-                visually_similar.append(image_url)
 
         return {
             "available": True,
-            "best_guess": best_guess,
-            "web_entities": entities[:10],
-            "matching_pages": matching_pages[:10],
-            "full_matches": full_matches[:5],
-            "partial_matches": partial_matches[:5],
-            "visually_similar": visually_similar[:5]
+            **result
         }
 
     except Exception as error:
 
         print(
-            "Online verification error:",
+            "Gemini analysis error:",
             error
         )
 
         return {
             "available": False,
-            "message": "Online verification failed."
+            "identified": False,
+            "message": "Gemini image analysis failed."
         }
+
+
+def search_online(query):
+
+    try:
+
+        search_query = urllib.parse.quote(
+            query
+        )
+
+        search_url = (
+            "https://en.wikipedia.org/w/api.php"
+            "?action=query"
+            "&list=search"
+            "&srsearch="
+            + search_query
+            + "&format=json"
+            "&utf8=1"
+            "&srlimit=5"
+        )
+
+        req = urllib.request.Request(
+            search_url,
+            headers={
+                "User-Agent": "SnowAI/1.0"
+            }
+        )
+
+        with urllib.request.urlopen(
+            req,
+            timeout=10
+        ) as response:
+
+            search_data = json.loads(
+                response.read().decode(
+                    "utf-8"
+                )
+            )
+
+        search_results = (
+            search_data
+            .get("query", {})
+            .get("search", [])
+        )
+
+        results = []
+
+        for item in search_results:
+
+            title = item.get(
+                "title"
+            )
+
+            if title:
+
+                results.append({
+                    "title": title,
+                    "url":
+                        "https://en.wikipedia.org/wiki/"
+                        + urllib.parse.quote(
+                            title.replace(
+                                " ",
+                                "_"
+                            )
+                        )
+                })
+
+        return {
+            "available": True,
+            "found": bool(results),
+            "results": results
+        }
+
+    except Exception as error:
+
+        print(
+            "Online search error:",
+            error
+        )
+
+        return {
+            "available": False,
+            "found": False,
+            "results": []
+        }
+
+
+def get_online_summary(title):
+
+    try:
+
+        encoded_title = urllib.parse.quote(
+            title.replace(
+                " ",
+                "_"
+            )
+        )
+
+        url = (
+            "https://en.wikipedia.org/api/rest_v1/page/summary/"
+            + encoded_title
+        )
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "SnowAI/1.0"
+            }
+        )
+
+        with urllib.request.urlopen(
+            req,
+            timeout=10
+        ) as response:
+
+            data = json.loads(
+                response.read().decode(
+                    "utf-8"
+                )
+            )
+
+        extract = data.get(
+            "extract"
+        )
+
+        if not extract:
+            return None
+
+        return {
+            "title":
+                data.get(
+                    "title",
+                    title
+                ),
+            "description":
+                data.get(
+                    "description"
+                ),
+            "summary":
+                extract,
+            "url":
+                data.get(
+                    "content_urls",
+                    {}
+                )
+                .get(
+                    "desktop",
+                    {}
+                )
+                .get(
+                    "page"
+                )
+        }
+
+    except Exception as error:
+
+        print(
+            "Online summary error:",
+            error
+        )
+
+        return None
+
+
+def research_object(
+    object_name,
+    precise_name=None
+):
+
+    query = (
+        precise_name
+        if precise_name
+        else object_name
+    )
+
+    key = query.lower().strip()
+
+    if key in knowledge_base:
+
+        return {
+            "available": True,
+            "learned_before": True,
+            "source":
+                "Snow AI knowledge base",
+            "knowledge":
+                knowledge_base[key]
+        }
+
+    search = search_online(
+        query
+    )
+
+    if not search.get(
+        "found"
+    ):
+
+        return {
+            "available":
+                search.get(
+                    "available",
+                    False
+                ),
+            "learned_before":
+                False,
+            "source":
+                "Online research",
+            "knowledge":
+                None
+        }
+
+    summary = get_online_summary(
+        search["results"][0]["title"]
+    )
+
+    if not summary:
+
+        return {
+            "available": True,
+            "learned_before": False,
+            "source":
+                "Online research",
+            "knowledge":
+                None
+        }
+
+    knowledge = {
+        "object":
+            object_name.title(),
+        "online_title":
+            summary.get(
+                "title"
+            ),
+        "description":
+            summary.get(
+                "description"
+            ),
+        "summary":
+            summary.get(
+                "summary"
+            ),
+        "source":
+            "Wikipedia",
+        "source_url":
+            summary.get(
+                "url"
+            ),
+        "learned_at":
+            datetime.now().isoformat()
+    }
+
+    knowledge_base[key] = knowledge
+
+    save_knowledge(
+        knowledge_base
+    )
+
+    return {
+        "available": True,
+        "learned_before": False,
+        "source":
+            "Online research",
+        "knowledge":
+            knowledge
+    }
 
 
 def determine_precise_identity(
     object_name,
-    web_result
+    gemini_result
 ):
 
-    best_guess = web_result.get(
-        "best_guess",
-        []
-    )
-
-    entities = web_result.get(
-        "web_entities",
-        []
-    )
-
-    online_names = []
-
-    for item in best_guess:
-
-        online_names.append(
-            item.lower()
-        )
-
-    for entity in entities:
-
-        name = entity.get(
-            "name",
-            ""
-        )
-
-        if name:
-
-            online_names.append(
-                name.lower()
-            )
-
-    known_species = [
-        {
-            "common": "Bonobo",
-            "scientific": "Pan paniscus",
-            "type": "Great ape",
-            "keywords": [
-                "bonobo",
-                "pan paniscus"
-            ]
-        },
-        {
-            "common": "Okapi",
-            "scientific": "Okapia johnstoni",
-            "type": "Giraffid",
-            "keywords": [
-                "okapi",
-                "okapia johnstoni"
-            ]
-        },
-        {
-            "common": "Likweli",
-            "scientific": "Colobus congoensis",
-            "type": "Colobus monkey",
-            "keywords": [
-                "likweli",
-                "colobus congoensis"
-            ]
-        }
-    ]
-
-    for species in known_species:
-
-        for online_name in online_names:
-
-            for keyword in species["keywords"]:
-
-                if keyword in online_name:
-
-                    return {
-                        "identified": True,
-                        "type": species["type"],
-                        "species": species["common"],
-                        "scientific_name":
-                            species["scientific"],
-                        "source":
-                            "Online web verification"
-                    }
-
-    if best_guess:
+    if not gemini_result.get(
+        "available"
+    ):
 
         return {
-            "identified": True,
-            "type": object_name.title(),
-            "species": best_guess[0],
+            "identified": False,
+            "type":
+                object_name.title(),
+            "species": "Unknown",
             "scientific_name": None,
+            "breed": None,
             "source":
-                "Online web verification"
+                "Snow AI object detection"
+        }
+
+    confidence = float(
+        gemini_result.get(
+            "confidence",
+            0
+        )
+    )
+
+    if not gemini_result.get(
+        "identified"
+    ) or confidence < 0.70:
+
+        return {
+            "identified": False,
+            "type":
+                gemini_result.get(
+                    "type",
+                    object_name.title()
+                ),
+            "species": "Unknown",
+            "scientific_name": None,
+            "breed": None,
+            "source":
+                "Insufficient visual evidence"
         }
 
     return {
-        "identified": False,
-        "type": object_name.title(),
-        "species": "Unknown",
-        "scientific_name": None,
+        "identified": True,
+        "type":
+            gemini_result.get(
+                "type",
+                object_name.title()
+            ),
+        "species":
+            gemini_result.get(
+                "species"
+            ),
+        "scientific_name":
+            gemini_result.get(
+                "scientific_name"
+            ),
+        "breed":
+            gemini_result.get(
+                "breed"
+            ),
         "source":
-            "Snow AI object detection only"
+            "YOLO + Gemini visual verification"
     }
 
 
@@ -343,11 +560,18 @@ def determine_precise_identity(
 def home():
 
     return jsonify({
-        "name": "Snow AI",
-        "status": "online",
-        "gps": "supported",
-        "online_verification":
-            bool(VISION_API_KEY)
+        "name":
+            "Snow AI",
+        "status":
+            "online",
+        "gps":
+            "supported",
+        "online_research":
+            True,
+        "knowledge_base":
+            True,
+        "gemini":
+            bool(gemini_client)
     })
 
 
@@ -365,14 +589,16 @@ def detect():
 
             return jsonify({
                 "success": False,
-                "error": "No JSON data received"
+                "error":
+                    "No JSON data received"
             }), 400
 
         if "image" not in data:
 
             return jsonify({
                 "success": False,
-                "error": "No image provided"
+                "error":
+                    "No image provided"
             }), 400
 
         image_data = data["image"]
@@ -397,19 +623,27 @@ def detect():
 
         accuracy = data.get(
             "accuracy",
-            data.get("gps_accuracy")
+            data.get(
+                "gps_accuracy"
+            )
         )
 
         try:
 
             if latitude is not None:
-                latitude = float(latitude)
+                latitude = float(
+                    latitude
+                )
 
             if longitude is not None:
-                longitude = float(longitude)
+                longitude = float(
+                    longitude
+                )
 
             if accuracy is not None:
-                accuracy = float(accuracy)
+                accuracy = float(
+                    accuracy
+                )
 
         except (
             ValueError,
@@ -418,35 +652,40 @@ def detect():
 
             return jsonify({
                 "success": False,
-                "error": "Invalid GPS coordinates"
+                "error":
+                    "Invalid GPS coordinates"
             }), 400
 
-        if latitude is not None:
+        if (
+            latitude is not None
+            and not -90 <= latitude <= 90
+        ):
 
-            if latitude < -90 or latitude > 90:
+            return jsonify({
+                "success": False,
+                "error":
+                    "Latitude must be between -90 and 90"
+            }), 400
 
-                return jsonify({
-                    "success": False,
-                    "error":
-                        "Latitude must be between -90 and 90"
-                }), 400
+        if (
+            longitude is not None
+            and not -180 <= longitude <= 180
+        ):
 
-        if longitude is not None:
-
-            if longitude < -180 or longitude > 180:
-
-                return jsonify({
-                    "success": False,
-                    "error":
-                        "Longitude must be between -180 and 180"
-                }), 400
+            return jsonify({
+                "success": False,
+                "error":
+                    "Longitude must be between -180 and 180"
+            }), 400
 
         if "," in image_data:
 
-            image_data = image_data.split(
-                ",",
-                1
-            )[1]
+            image_data = (
+                image_data.split(
+                    ",",
+                    1
+                )[1]
+            )
 
         try:
 
@@ -458,7 +697,8 @@ def detect():
 
             return jsonify({
                 "success": False,
-                "error": "Invalid Base64 image"
+                "error":
+                    "Invalid Base64 image"
             }), 400
 
         frame = cv2.imdecode(
@@ -473,16 +713,15 @@ def detect():
 
             return jsonify({
                 "success": False,
-                "error": "Invalid image"
+                "error":
+                    "Invalid image"
             }), 400
 
-        results = model(frame)
+        results = model(
+            frame
+        )
 
         objects = []
-
-        online_result = verify_image_online(
-            image_bytes
-        )
 
         for result in results:
 
@@ -496,30 +735,62 @@ def detect():
                     box.conf[0]
                 )
 
-                object_name = model.names[
-                    class_id
-                ].lower()
+                object_name = (
+                    model.names[
+                        class_id
+                    ]
+                    .lower()
+                )
 
                 description = object_info.get(
                     object_name,
-                    "Snow AI detected this object, "
-                    "but a built-in description "
-                    "is not available yet."
+                    "Snow AI detected this object, but a built-in description is not available yet."
                 )
 
-                precise = determine_precise_identity(
+                gemini_result = (
+                    analyze_image_with_gemini(
+                        image_bytes,
+                        object_name,
+                        confidence
+                    )
+                )
+
+                precise = (
+                    determine_precise_identity(
+                        object_name,
+                        gemini_result
+                    )
+                )
+
+                precise_name = (
+                    precise.get(
+                        "species"
+                    )
+                    or precise.get(
+                        "breed"
+                    )
+                    or precise.get(
+                        "type"
+                    )
+                    or object_name
+                )
+
+                research = research_object(
                     object_name,
-                    online_result
+                    precise_name
                 )
 
                 google_url = (
                     "https://www.google.com/search?q="
                     + urllib.parse.quote(
-                        (
-                            precise.get("species")
-                            or object_name
-                        )
+                        precise_name
                         + " information"
+                    )
+                )
+
+                online_knowledge = (
+                    research.get(
+                        "knowledge"
                     )
                 )
 
@@ -532,14 +803,23 @@ def detect():
                         f"{confidence:.1%}",
 
                     "type":
-                        precise.get("type"),
+                        precise.get(
+                            "type"
+                        ),
 
                     "species":
-                        precise.get("species"),
+                        precise.get(
+                            "species"
+                        ),
 
                     "scientific_name":
                         precise.get(
                             "scientific_name"
+                        ),
+
+                    "breed":
+                        precise.get(
+                            "breed"
                         ),
 
                     "identification_source":
@@ -547,8 +827,26 @@ def detect():
                             "source"
                         ),
 
+                    "gemini":
+                        gemini_result,
+
                     "description":
                         description,
+
+                    "online_research":
+                        research.get(
+                            "available",
+                            False
+                        ),
+
+                    "learned_before":
+                        research.get(
+                            "learned_before",
+                            False
+                        ),
+
+                    "online_knowledge":
+                        online_knowledge,
 
                     "google_url":
                         google_url
@@ -561,9 +859,6 @@ def detect():
 
             "snow_ai":
                 True,
-
-            "online_verification":
-                online_result,
 
             "timestamp":
                 timestamp,
