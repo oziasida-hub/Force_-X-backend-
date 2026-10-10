@@ -12,9 +12,15 @@ import urllib.parse
 import urllib.request
 import json
 import os
+import hashlib
+import hmac
+import base64
+from threading import Lock
 
 
 app = Flask(__name__)
+
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 CORS(
     app,
@@ -571,7 +577,9 @@ def home():
         "knowledge_base":
             True,
         "gemini":
-            bool(gemini_client)
+            bool(gemini_client),
+        "drone_upload":
+            bool(os.environ.get("DRONE_UPLOAD_TOKEN"))
     })
 
 
@@ -897,6 +905,209 @@ def detect():
             "error":
                 str(error)
 
+        }), 500
+
+
+DRONE_UPLOAD_TOKEN = os.environ.get(
+    "DRONE_UPLOAD_TOKEN"
+)
+
+drone_upload_lock = Lock()
+recent_drone_images = set()
+MAX_RECENT_DRONE_IMAGES = 500
+
+
+@app.route(
+    "/drone-upload",
+    methods=["POST"]
+)
+def drone_upload():
+
+    if not DRONE_UPLOAD_TOKEN:
+
+        return jsonify({
+            "success": False,
+            "error": "Drone uploads are not configured."
+        }), 503
+
+    supplied_token = request.headers.get(
+        "Authorization",
+        ""
+    ).removeprefix("Bearer ").strip()
+
+    if not hmac.compare_digest(
+        supplied_token,
+        DRONE_UPLOAD_TOKEN
+    ):
+
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized drone upload."
+        }), 401
+
+    image_bytes = None
+
+    timestamp = datetime.now().isoformat()
+
+    if request.files.get("image"):
+
+        uploaded_file = request.files["image"]
+
+        if uploaded_file.mimetype not in (
+            "image/jpeg",
+            "image/png",
+            "image/webp"
+        ):
+
+            return jsonify({
+                "success": False,
+                "error": "Unsupported image type."
+            }), 415
+
+        image_bytes = uploaded_file.read()
+
+    elif request.is_json:
+
+        data = request.get_json(
+            silent=True
+        ) or {}
+
+        image_data = data.get(
+            "image"
+        )
+
+        if (
+            not isinstance(image_data, str)
+            or not image_data
+        ):
+
+            return jsonify({
+                "success": False,
+                "error": "Missing image."
+            }), 400
+
+        if "," in image_data:
+
+            image_data = image_data.split(
+                ",",
+                1
+            )[1]
+
+        try:
+
+            image_bytes = base64.b64decode(
+                image_data,
+                validate=True
+            )
+
+        except Exception:
+
+            return jsonify({
+                "success": False,
+                "error": "Invalid Base64 image."
+            }), 400
+
+        timestamp = data.get(
+            "timestamp",
+            timestamp
+        )
+
+    else:
+
+        return jsonify({
+            "success": False,
+            "error": "Send an image file or JSON image data."
+        }), 400
+
+    if not image_bytes:
+
+        return jsonify({
+            "success": False,
+            "error": "The uploaded image is empty."
+        }), 400
+
+    if len(image_bytes) > 12 * 1024 * 1024:
+
+        return jsonify({
+            "success": False,
+            "error": "Image exceeds the 12 MB upload limit."
+        }), 413
+
+    image_hash = hashlib.sha256(
+        image_bytes
+    ).hexdigest()
+
+    with drone_upload_lock:
+
+        if image_hash in recent_drone_images:
+
+            return jsonify({
+                "success": True,
+                "duplicate": True,
+                "message": "This image was already processed."
+            }), 200
+
+    encoded_image = base64.b64encode(
+        image_bytes
+    ).decode("ascii")
+
+    payload = {
+        "image": "data:image/jpeg;base64," + encoded_image,
+        "timestamp": timestamp,
+        "duration": "0"
+    }
+
+    try:
+
+        with app.test_request_context(
+            "/detect",
+            method="POST",
+            json=payload
+        ):
+
+            response = detect()
+
+        if isinstance(response, tuple):
+
+            response_body = response[0]
+            status_code = response[1]
+
+        else:
+
+            response_body = response
+            status_code = response.status_code
+
+        if status_code >= 400:
+
+            return response_body, status_code
+
+        with drone_upload_lock:
+
+            recent_drone_images.add(
+                image_hash
+            )
+
+            if len(
+                recent_drone_images
+            ) > MAX_RECENT_DRONE_IMAGES:
+
+                recent_drone_images.clear()
+
+                recent_drone_images.add(
+                    image_hash
+                )
+
+        return response_body, status_code
+
+    except Exception:
+
+        app.logger.exception(
+            "Drone image processing failed"
+        )
+
+        return jsonify({
+            "success": False,
+            "error": "Snow AI could not process the drone image."
         }), 500
 
 
